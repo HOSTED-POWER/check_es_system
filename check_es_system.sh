@@ -275,32 +275,45 @@ fi
 ################################################################################
 # Retrieve information from Elasticsearch cluster
 getstatus() {
-cluster_filter_path='cluster_name,status,indices.store.size_in_bytes,indices.shards.total,indices.docs.count,nodes.count.total,nodes.count.data,nodes.fs.total_in_bytes,nodes.jvm.mem.heap_used_in_bytes,nodes.jvm.mem.heap_max_in_bytes,nodes.jvm.threads,nodes.process.cpu.percent'
-local_filter_path='cluster_name,nodes.*.indices.store.size_in_bytes,nodes.*.fs.total.total_in_bytes,nodes.*.jvm.mem.heap_used_in_bytes,nodes.*.jvm.mem.heap_max_in_bytes,nodes.*.jvm.threads.count,nodes.*.process.cpu.percent'
-health_filter_path='cluster_name,status,number_of_nodes,number_of_data_nodes,active_primary_shards,active_shards,relocating_shards,initializing_shards,unassigned_shards'
+health_filter_path='cluster_name,status,number_of_nodes,number_of_data_nodes,active_primary_shards,active_shards,relocating_shards,initializing_shards,unassigned_shards,error'
+status_health_filter_path='relocating_shards,initializing_shards,unassigned_shards,error'
 
 if [[ $checktype = online ]]; then
   esurl="${httpscheme}://${host}:${port}/_cluster/health?filter_path=${health_filter_path}"
 elif [[ ${local} ]]; then
+  case $checktype in
+    disk) local_filter_path='cluster_name,nodes.*.indices.store.size_in_bytes,nodes.*.fs.total.total_in_bytes,error' ;;
+    mem) local_filter_path='cluster_name,nodes.*.jvm.mem.heap_used_in_bytes,nodes.*.jvm.mem.heap_max_in_bytes,error' ;;
+    cpu) local_filter_path='cluster_name,nodes.*.process.cpu.percent,error' ;;
+    jthreads) local_filter_path='cluster_name,nodes.*.jvm.threads.count,error' ;;
+  esac
   esurl="${httpscheme}://${host}:${port}/_nodes/_local/stats?filter_path=${local_filter_path}"
 else
+  case $checktype in
+    status) cluster_filter_path='cluster_name,status,indices.shards.total,indices.docs.count,nodes.count.total,nodes.count.data,error' ;;
+    disk) cluster_filter_path='cluster_name,indices.store.size_in_bytes,nodes.fs.total_in_bytes,error' ;;
+    mem) cluster_filter_path='cluster_name,nodes.jvm.mem.heap_used_in_bytes,nodes.jvm.mem.heap_max_in_bytes,error' ;;
+    cpu) cluster_filter_path='cluster_name,nodes.process.cpu.percent,error' ;;
+    jthreads) cluster_filter_path='cluster_name,nodes.jvm.threads,error' ;;
+    readonly|tps|master) cluster_filter_path='cluster_name,error' ;;
+  esac
   esurl="${httpscheme}://${host}:${port}/_cluster/stats?filter_path=${cluster_filter_path}"
 fi
-eshealthurl="${httpscheme}://${host}:${port}/_cluster/health?filter_path=${health_filter_path}"
+eshealthurl="${httpscheme}://${host}:${port}/_cluster/health?filter_path=${status_health_filter_path}"
 
 if [[ -z $user ]] && [[ -z $cert ]]; then
   # Without authentication
-  esstatus=$(curl -k -s --max-time ${max_time} $esurl)
+  esstatus=$(curl -k -s --max-time "${max_time}" "$esurl")
   esstatusrc=$?
 elif [[ -n $user ]] || [[ -n $(echo $esstatus | grep -i authentication) ]] ; then
   # Authentication with user credentials
   authlogic
-  esstatus=$(curl -k -s --max-time ${max_time} --basic -u ${user}:${pass} $esurl)
+  esstatus=$(curl -k -s --max-time "${max_time}" --basic -u "${user}:${pass}" "$esurl")
   esstatusrc=$?
 elif [[ -n $cert ]] || [[ -n $(echo $esstatus | grep -i authentication) ]] ; then
   # Authentication with certificate
   authlogic_cert
-  esstatus=$(curl -k -s --max-time ${max_time} -E ${cert} --key ${key} $esurl)
+  esstatus=$(curl -k -s --max-time "${max_time}" -E "${cert}" --key "${key}" "$esurl")
   esstatusrc=$?
 fi
 
@@ -327,21 +340,30 @@ fi
 if [ $checktype = status ]; then
   if [[ -z $user ]] && [[ -z $cert ]]; then
     # Without authentication
-    eshealth=$(curl -k -s --max-time ${max_time} $eshealthurl)
+    eshealth=$(curl -k -s --max-time "${max_time}" "$eshealthurl")
     eshealthrc=$?
   fi
   if [[ -n $user ]] || [[ -n $(echo $esstatus | grep -i authentication) ]] ; then
     # Authentication required
-    eshealth=$(curl -k -s --max-time ${max_time} --basic -u ${user}:${pass} $eshealthurl)
+    eshealth=$(curl -k -s --max-time "${max_time}" --basic -u "${user}:${pass}" "$eshealthurl")
     eshealthrc=$?
   fi
   if [[ -n $cert ]] || [[ -n $(echo $esstatus | grep -i authentication) ]] ; then
     # Authentication with certificate
-    eshealth=$(curl -k -s --max-time ${max_time} -E ${cert} --key ${key} $eshealthurl)
+    eshealth=$(curl -k -s --max-time "${max_time}" -E "${cert}" --key "${key}" "$eshealthurl")
     eshealthrc=$?
   fi
   check_curl_result "$eshealthrc"
   if [[ -z $eshealth ]]; then
+    echo "ES SYSTEM CRITICAL - unable to get cluster health information"
+    exit $STATE_CRITICAL
+  elif [[ -n $(echo "$eshealth" | grep -i "unable to authenticate") ]]; then
+    echo "ES SYSTEM CRITICAL - Unable to authenticate user $user for cluster health request"
+    exit $STATE_CRITICAL
+  elif [[ -n $(echo "$eshealth" | grep -i "unauthorized") ]]; then
+    echo "ES SYSTEM CRITICAL - User $user is unauthorized for cluster health request"
+    exit $STATE_CRITICAL
+  elif ! [[ "$eshealth" =~ "relocating_shards" ]]; then
     echo "ES SYSTEM CRITICAL - unable to get cluster health information"
     exit $STATE_CRITICAL
   fi
@@ -499,20 +521,22 @@ online) # Check Elasticsearch availability while accepting green and yellow heal
 readonly) # Check Readonly status on given indexes
   getstatus
   icount=0
+  settings_filter_path='*.settings.index.blocks.read_only,*.settings.index.blocks.read_only_allow_delete,*.settings.index.provided_name,error'
   for index in $include; do
+    settingsurl="${httpscheme}://${host}:${port}/$index/_settings?filter_path=${settings_filter_path}"
     if [[ -z $user ]] && [[ -z $cert ]]; then
       # Without authentication
-      settings=$(curl -k -s --max-time ${max_time} ${httpscheme}://${host}:${port}/$index/_settings)
+      settings=$(curl -k -s --max-time "${max_time}" "$settingsurl")
 	  settingsrc=$?
 	elif [[ -n $user ]] || [[ -n $(echo $esstatus | grep -i authentication) ]] ; then
 	  # Authentication with user credentials
 	  authlogic
-	  settings=$(curl -k -s --max-time ${max_time} --basic -u ${user}:${pass} ${httpscheme}://${host}:${port}/$index/_settings)
+	  settings=$(curl -k -s --max-time "${max_time}" --basic -u "${user}:${pass}" "$settingsurl")
 	  settingsrc=$?
 	elif [[ -n $cert ]] || [[ -n $(echo $esstatus | grep -i authentication) ]] ; then
 	  # Authentication with certificate
 	  authlogic_cert
-	  settings=$(curl -k -s --max-time ${max_time} -E ${cert} --key ${key} ${httpscheme}://${host}:${port}/$index/_settings)
+	  settings=$(curl -k -s --max-time "${max_time}" -E "${cert}" --key "${key}" "$settingsurl")
 	  settingsrc=$?
 	fi
 
@@ -597,19 +621,20 @@ jthreads) # Check JVM threads
 
 tps) # Check Thread Pool Statistics
   getstatus
+  threadpoolurl="${httpscheme}://${host}:${port}/_cat/thread_pool?h=node_name,name,active,queue,rejected"
   if [[ -z $user ]] && [[ -z $cert ]]; then
     # Without authentication
-    threadpools=$(curl -k -s --max-time ${max_time} ${httpscheme}://${host}:${port}/_cat/thread_pool)
+    threadpools=$(curl -k -s --max-time "${max_time}" "$threadpoolurl")
     threadpoolrc=$?
   elif [[ -n $user ]] || [[ -n $(echo $esstatus | grep -i authentication) ]] ; then
 	# Authentication with user credentials
 	authlogic
-	threadpools=$(curl -k -s --max-time ${max_time} --basic -u ${user}:${pass} ${httpscheme}://${host}:${port}/_cat/thread_pool)
+	threadpools=$(curl -k -s --max-time "${max_time}" --basic -u "${user}:${pass}" "$threadpoolurl")
     threadpoolrc=$?
   elif [[ -n $cert ]] || [[ -n $(echo $esstatus | grep -i authentication) ]] ; then
 	# Authentication with certificate
 	authlogic_cert
-	threadpools=$(curl -k -s --max-time ${max_time} -E ${cert} --key ${key} ${httpscheme}://${host}:${port}/_cat/thread_pool)
+	threadpools=$(curl -k -s --max-time "${max_time}" -E "${cert}" --key "${key}" "$threadpoolurl")
     threadpoolrc=$?
   fi
 
@@ -708,19 +733,20 @@ tps) # Check Thread Pool Statistics
 
 master) # Check Cluster Master
   getstatus
+  masterurl="${httpscheme}://${host}:${port}/_cat/master?h=node"
   if [[ -z $user ]] && [[ -z $cert ]]; then
     # Without authentication
-    master=$(curl -k -s --max-time ${max_time} ${httpscheme}://${host}:${port}/_cat/master)
+    master=$(curl -k -s --max-time "${max_time}" "$masterurl")
     masterrc=$?
   elif [[ -n $user ]] || [[ -n $(echo $esstatus | grep -i authentication) ]] ; then
 	# Authentication with user credentials
 	authlogic
-	master=$(curl -k -s --max-time ${max_time} --basic -u ${user}:${pass} ${httpscheme}://${host}:${port}/_cat/master)
+	master=$(curl -k -s --max-time "${max_time}" --basic -u "${user}:${pass}" "$masterurl")
     masterrc=$?
   elif [[ -n $cert ]] || [[ -n $(echo $esstatus | grep -i authentication) ]] ; then
 	# Authentication with certificate
 	authlogic_cert
-    master=$(curl -k -s --max-time ${max_time} -E ${cert} --key ${key} ${httpscheme}://${host}:${port}/_cat/master)
+    master=$(curl -k -s --max-time "${max_time}" -E "${cert}" --key "${key}" "$masterurl")
     masterrc=$?
   fi
 

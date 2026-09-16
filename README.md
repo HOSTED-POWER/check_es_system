@@ -3,6 +3,8 @@ This is an open source monitoring plugin to check the status of an Elasticsearch
 
 The `online` check is intended for high-priority availability monitoring. It treats both green and yellow cluster health as OK, while red health, connection failures, timeouts, authentication failures, and invalid Elasticsearch responses are CRITICAL. This gives single-node clusters—which are commonly yellow because replicas cannot be assigned—a stable OK baseline for retry-based alerting. Use the separate `status` check when yellow must remain a WARNING.
 
+API response filtering is enabled automatically. Each check uses a check-specific `filter_path` containing only the JSON fields it consumes plus Elasticsearch's top-level `error` field. CAT API checks use an explicit `h` column list for the same purpose. No extra command-line option is required.
+
 The plugin was initially written for Elasticsearch but also works on OpenSearch.
 
 Please refer to https://www.claudiokuenzler.com/monitoring-plugins/check_es_system.php for full documentation and usage examples.

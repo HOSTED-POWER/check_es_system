@@ -14,6 +14,10 @@ if [[ -z $url ]]; then
   exit 2
 fi
 
+if [[ -n ${MOCK_CURL_LOG:-} ]]; then
+  printf '%s\n' "$url" >> "$MOCK_CURL_LOG"
+fi
+
 if [[ $scenario == connection_failure ]]; then
   echo "curl: (7) Failed to connect" >&2
   exit 7
@@ -32,7 +36,7 @@ if [[ $url == *'/_cluster/stats'* ]]; then
 
   status=$scenario
   case $status in
-    health_failure|master_failure|empty_master) status=green ;;
+    health_failure|health_unauthorized|master_failure|empty_master) status=green ;;
     unknown) status=blue ;;
   esac
 
@@ -59,6 +63,9 @@ if [[ $url == *'/_cluster/health'* ]]; then
   if [[ $scenario == health_failure ]]; then
     echo "curl: (28) Operation timed out" >&2
     exit 28
+  elif [[ $scenario == health_unauthorized ]]; then
+    printf '%s\n' '{"error":{"type":"security_exception","reason":"action is unauthorized"},"status":403}'
+    exit 0
   fi
 
   status=$scenario
@@ -79,7 +86,21 @@ if [[ $url == *'/_cat/master'* ]]; then
   if [[ $scenario == empty_master ]]; then
     exit 0
   fi
-  echo "node-id 127.0.0.1 test-master"
+  if [[ $url == *'h=node'* ]]; then
+    echo "test-master"
+  else
+    echo "node-id 127.0.0.1 test-master"
+  fi
+  exit 0
+fi
+
+if [[ $url == *'/_settings'* ]]; then
+  printf '%s\n' '{"test-index":{"settings":{"index":{"provided_name":"test-index"}}}}'
+  exit 0
+fi
+
+if [[ $url == *'/_cat/thread_pool'* ]]; then
+  echo "test-node search 0 0 0"
   exit 0
 fi
 
