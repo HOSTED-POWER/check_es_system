@@ -1,0 +1,20 @@
+name: Test
+
+on:
+  push:
+  pull_request:
+
+permissions:
+  contents: read
+
+jobs:
+  regression-tests:
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+      - name: Install test dependencies
+        run: sudo apt-get update -q && sudo apt-get install -y jq
+      - name: Validate Bash syntax
+        run: bash -n check_es_system.sh test/bin/curl test/test_regressions.sh
+      - name: Run deterministic regression tests
+        run: test/test_regressions.sh

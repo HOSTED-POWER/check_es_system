@@ -1,6 +1,7 @@
 # check_es_system (Elasticsearch and OpenSearch Monitoring Plugin)
-This is an open source monitoring plugin to check the status of an ElasticSearch or OpenSearch cluster or a single node. Besides the classical status check (green, yellow, red) this plugin also allows to monitor disk or memory usage of Elasticsearch. This is especially helpful when running Elasticsearch in the cloud (e.g. Elasticsearch as a service) because, as ES does not run on your own server, you cannot monitor the disk or memory usage. This is where this plugin comes in. Just tell the plugin how much resources (diskspace, memory capacity) you have available (-d) and it will alarm you when you reach a threshold.
-Besides that, the plugin offers additional (advanced) checks of a Elasticsearch node/cluster (Java Threads, Thread Pool Statistics, Master Verification, Read-Only Indexes, ...).
+This is an open source monitoring plugin to check the status of an Elasticsearch or OpenSearch cluster or a single node. Besides the classical status check (green, yellow, red), this plugin can monitor availability, disk usage, memory usage, CPU usage, JVM threads, thread pools, the elected master, and read-only indexes.
+
+The `online` check is intended for high-priority availability monitoring. It treats both green and yellow cluster health as OK, while red health, connection failures, timeouts, authentication failures, and invalid Elasticsearch responses are CRITICAL. This gives single-node clusters—which are commonly yellow because replicas cannot be assigned—a stable OK baseline for retry-based alerting. Use the separate `status` check when yellow must remain a WARNING.
 
 The plugin was initially written for Elasticsearch but also works on OpenSearch.
 
@@ -15,3 +16,23 @@ Usage
 ------
 
     ./check_es_system.sh -H NodeOrClusterAddress [-P port] [-S] [-L] [-u user] [-p pass] [-E certificate] [-K key] -t check [-o unit] [-i index1,index2] [-w warn] [-c crit] [-m max_time] [-e node] [-X jq|jshon]
+
+Availability check:
+
+    ./check_es_system.sh -H 127.0.0.1 -P 9200 -t online
+
+Detailed cluster-health check:
+
+    ./check_es_system.sh -H 127.0.0.1 -P 9200 -t status
+
+| Check | Green | Yellow | Red/unreachable |
+| --- | --- | --- | --- |
+| `online` | OK | OK | CRITICAL |
+| `status` | OK | WARNING | CRITICAL |
+
+Tests
+------
+
+The deterministic regression suite uses a mocked `curl` command and does not require Elasticsearch:
+
+    bash test/test_regressions.sh

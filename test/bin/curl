@@ -1,0 +1,87 @@
+#!/usr/bin/env bash
+
+scenario=${MOCK_ES_SCENARIO:-green}
+url=
+
+for argument in "$@"; do
+  case $argument in
+    http://*|https://*) url=$argument ;;
+  esac
+done
+
+if [[ -z $url ]]; then
+  echo "mock curl: URL missing" >&2
+  exit 2
+fi
+
+if [[ $scenario == connection_failure ]]; then
+  echo "curl: (7) Failed to connect" >&2
+  exit 7
+fi
+
+if [[ $url == *'/_cluster/stats'* ]]; then
+  if [[ ${MOCK_REQUIRE_FILTER_PATH:-0} == 1 ]]; then
+    if [[ $url != *'filter_path='* ]]; then
+      echo "mock curl: cluster stats request is missing filter_path" >&2
+      exit 22
+    elif [[ $url != *'nodes.fs.total_in_bytes'* ]]; then
+      echo "mock curl: cluster stats filter is missing nodes.fs.total_in_bytes" >&2
+      exit 22
+    fi
+  fi
+
+  status=$scenario
+  case $status in
+    health_failure|master_failure|empty_master) status=green ;;
+    unknown) status=blue ;;
+  esac
+
+  printf '{"cluster_name":"test-cluster","status":"%s","indices":{"store":{"size_in_bytes":0},"shards":{"total":8},"docs":{"count":42}},"nodes":{"count":{"total":1,"data":1},"fs":{"total_in_bytes":1073741824},"jvm":{"mem":{"heap_used_in_bytes":1048576,"heap_max_in_bytes":2097152},"threads":10},"process":{"cpu":{"percent":1}}}}\n' "$status"
+  exit 0
+fi
+
+if [[ $url == *'/_nodes/_local/stats'* ]]; then
+  if [[ ${MOCK_REQUIRE_FILTER_PATH:-0} == 1 ]]; then
+    if [[ $url != *'filter_path='* ]]; then
+      echo "mock curl: local stats request is missing filter_path" >&2
+      exit 22
+    elif [[ $url != *'nodes.*.fs.total.total_in_bytes'* ]]; then
+      echo "mock curl: local stats filter is missing nodes.*.fs.total.total_in_bytes" >&2
+      exit 22
+    fi
+  fi
+
+  printf '%s\n' '{"cluster_name":"test-cluster","nodes":{"node-1":{"indices":{"store":{"size_in_bytes":0}},"fs":{"total":{"total_in_bytes":1073741824}},"jvm":{"mem":{"heap_used_in_bytes":1048576,"heap_max_in_bytes":2097152},"threads":{"count":10}},"process":{"cpu":{"percent":1}}}}}'
+  exit 0
+fi
+
+if [[ $url == *'/_cluster/health'* ]]; then
+  if [[ $scenario == health_failure ]]; then
+    echo "curl: (28) Operation timed out" >&2
+    exit 28
+  fi
+
+  status=$scenario
+  case $status in
+    master_failure|empty_master) status=green ;;
+    unknown) status=blue ;;
+  esac
+
+  printf '{"cluster_name":"test-cluster","status":"%s","number_of_nodes":1,"number_of_data_nodes":1,"active_primary_shards":4,"active_shards":4,"relocating_shards":0,"initializing_shards":0,"unassigned_shards":4}\n' "$status"
+  exit 0
+fi
+
+if [[ $url == *'/_cat/master'* ]]; then
+  if [[ $scenario == master_failure ]]; then
+    echo "curl: (7) Failed to connect" >&2
+    exit 7
+  fi
+  if [[ $scenario == empty_master ]]; then
+    exit 0
+  fi
+  echo "node-id 127.0.0.1 test-master"
+  exit 0
+fi
+
+echo "mock curl: unsupported URL: $url" >&2
+exit 22

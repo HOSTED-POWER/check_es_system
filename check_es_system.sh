@@ -62,6 +62,7 @@
 # 20211202: Added local node (-L), SSL settings (-K, -E), cpu check            #
 # 20230929: Bugfix in readonly check type for missing privileges               #
 # 20240906: Improving code, fix cert based auth on certain types (#53)         #
+# 20260916: Add online check and harden API error handling                     #
 ################################################################################
 #Variables and defaults
 STATE_OK=0              # define the exit code if status is OK
@@ -69,7 +70,7 @@ STATE_WARNING=1         # define the exit code if status is Warning
 STATE_CRITICAL=2        # define the exit code if status is Critical
 STATE_UNKNOWN=3         # define the exit code if status is Unknown
 export PATH=$PATH:/usr/local/bin:/usr/bin:/bin # Set path
-version=1.13.0
+version=1.14.0
 port=9200
 httpscheme=http
 unit=G
@@ -93,7 +94,7 @@ Options:
       -K Key for Cert based authentication
       -u Username if authentication is required
       -p Password if authentication is required
-   *  -t Type of check (disk, mem, cpu, status, readonly, jthreads, tps, master)
+   *  -t Type of check (disk, mem, cpu, status, online, readonly, jthreads, tps, master)
       -o Disk space unit (K|M|G) (defaults to G)
       -i Space separated list of included object names to be checked (index names on readonly check, pool names on tps check)
       -w Warning threshold (see usage notes below)
@@ -154,6 +155,21 @@ if [ -n $critical ] && [ -z $warning ]; then echo "UNKNOWN - Define both warning
 default_percentage_thresholds() {
 if [ -z $warning ] || [ "${warning}" = "" ]; then warning=80; fi
 if [ -z $critical ] || [ "${critical}" = "" ]; then critical=95; fi
+}
+
+check_curl_result() {
+local rc=$1
+
+if [[ $rc -eq 7 ]]; then
+  echo "ES SYSTEM CRITICAL - Failed to connect to ${host} port ${port}: Connection refused"
+  exit $STATE_CRITICAL
+elif [[ $rc -eq 28 ]]; then
+  echo "ES SYSTEM CRITICAL - server did not respond within ${max_time} seconds"
+  exit $STATE_CRITICAL
+elif [[ $rc -ne 0 ]]; then
+  echo "ES SYSTEM CRITICAL - request to ${host}:${port} failed (curl exit ${rc})"
+  exit $STATE_CRITICAL
+fi
 }
 
 json_parse() {
@@ -259,12 +275,18 @@ fi
 ################################################################################
 # Retrieve information from Elasticsearch cluster
 getstatus() {
-if [[ ${local} ]]; then
-  esurl="${httpscheme}://${host}:${port}/_nodes/_local/stats"
+cluster_filter_path='cluster_name,status,indices.store.size_in_bytes,indices.shards.total,indices.docs.count,nodes.count.total,nodes.count.data,nodes.fs.total_in_bytes,nodes.jvm.mem.heap_used_in_bytes,nodes.jvm.mem.heap_max_in_bytes,nodes.jvm.threads,nodes.process.cpu.percent'
+local_filter_path='cluster_name,nodes.*.indices.store.size_in_bytes,nodes.*.fs.total.total_in_bytes,nodes.*.jvm.mem.heap_used_in_bytes,nodes.*.jvm.mem.heap_max_in_bytes,nodes.*.jvm.threads.count,nodes.*.process.cpu.percent'
+health_filter_path='cluster_name,status,number_of_nodes,number_of_data_nodes,active_primary_shards,active_shards,relocating_shards,initializing_shards,unassigned_shards'
+
+if [[ $checktype = online ]]; then
+  esurl="${httpscheme}://${host}:${port}/_cluster/health?filter_path=${health_filter_path}"
+elif [[ ${local} ]]; then
+  esurl="${httpscheme}://${host}:${port}/_nodes/_local/stats?filter_path=${local_filter_path}"
 else
-  esurl="${httpscheme}://${host}:${port}/_cluster/stats"
+  esurl="${httpscheme}://${host}:${port}/_cluster/stats?filter_path=${cluster_filter_path}"
 fi
-eshealthurl="${httpscheme}://${host}:${port}/_cluster/health"
+eshealthurl="${httpscheme}://${host}:${port}/_cluster/health?filter_path=${health_filter_path}"
 
 if [[ -z $user ]] && [[ -z $cert ]]; then
   # Without authentication
@@ -282,13 +304,9 @@ elif [[ -n $cert ]] || [[ -n $(echo $esstatus | grep -i authentication) ]] ; the
   esstatusrc=$?
 fi
 
-if [[ $esstatusrc -eq 7 ]]; then
-  echo "ES SYSTEM CRITICAL - Failed to connect to ${host} port ${port}: Connection refused"
-  exit $STATE_CRITICAL
-elif [[ $esstatusrc -eq 28 ]]; then
-  echo "ES SYSTEM CRITICAL - server did not respond within ${max_time} seconds"
-  exit $STATE_CRITICAL
-elif [[ "$esstatus" =~ "503 Service Unavailable" ]]; then
+check_curl_result "$esstatusrc"
+
+if [[ "$esstatus" =~ "503 Service Unavailable" ]]; then
   echo "ES SYSTEM CRITICAL - Elasticsearch not available: ${host}:${port} return error 503"
   exit $STATE_CRITICAL
 elif [[ "$esstatus" =~ "Unknown resource" ]]; then
@@ -310,15 +328,19 @@ if [ $checktype = status ]; then
   if [[ -z $user ]] && [[ -z $cert ]]; then
     # Without authentication
     eshealth=$(curl -k -s --max-time ${max_time} $eshealthurl)
+    eshealthrc=$?
   fi
   if [[ -n $user ]] || [[ -n $(echo $esstatus | grep -i authentication) ]] ; then
     # Authentication required
     eshealth=$(curl -k -s --max-time ${max_time} --basic -u ${user}:${pass} $eshealthurl)
+    eshealthrc=$?
   fi
   if [[ -n $cert ]] || [[ -n $(echo $esstatus | grep -i authentication) ]] ; then
     # Authentication with certificate
     eshealth=$(curl -k -s --max-time ${max_time} -E ${cert} --key ${key} $eshealthurl)
+    eshealthrc=$?
   fi
+  check_curl_result "$eshealthrc"
   if [[ -z $eshealth ]]; then
     echo "ES SYSTEM CRITICAL - unable to get cluster health information"
     exit $STATE_CRITICAL
@@ -447,6 +469,30 @@ status) # Check Elasticsearch status
   elif [ "$status" = "red" ]; then
     echo "ES SYSTEM CRITICAL - Elasticsearch Cluster \"$clustername\" is red (${nodest} nodes, ${nodesd} data nodes, ${shards} shards, ${relocating} relocating shards, ${init} initializing shards, ${unass} unassigned shards, ${docs} docs)|total_nodes=${nodest};;;; data_nodes=${nodesd};;;; total_shards=${shards};;;; relocating_shards=${relocating};;;; initializing_shards=${init};;;; unassigned_shards=${unass};;;; docs=${docs};;;;"
       exit $STATE_CRITICAL
+  else
+    echo "ES SYSTEM UNKNOWN - Elasticsearch Cluster returned an unknown health status: ${status:-missing}"
+    exit $STATE_UNKNOWN
+  fi
+  ;;
+
+online) # Check Elasticsearch availability while accepting green and yellow health
+  getstatus
+  status=$(echo "$esstatus" | json_parse -r -x status)
+  clustername=$(echo "$esstatus" | json_parse -r -x cluster_name)
+  nodest=$(echo "$esstatus" | json_parse -r -x number_of_nodes)
+  nodesd=$(echo "$esstatus" | json_parse -r -x number_of_data_nodes)
+  active=$(echo "$esstatus" | json_parse -r -x active_shards)
+  unass=$(echo "$esstatus" | json_parse -r -x unassigned_shards)
+
+  if [[ $status = green || $status = yellow ]]; then
+    echo "ES SYSTEM OK - Elasticsearch Cluster \"$clustername\" is online with $status health (${nodest} nodes, ${nodesd} data nodes, ${active} active shards, ${unass} unassigned shards)|total_nodes=${nodest};;;; data_nodes=${nodesd};;;; active_shards=${active};;;; unassigned_shards=${unass};;;;"
+    exit $STATE_OK
+  elif [[ $status = red ]]; then
+    echo "ES SYSTEM CRITICAL - Elasticsearch Cluster \"$clustername\" is online but red (${nodest} nodes, ${nodesd} data nodes, ${active} active shards, ${unass} unassigned shards)|total_nodes=${nodest};;;; data_nodes=${nodesd};;;; active_shards=${active};;;; unassigned_shards=${unass};;;;"
+    exit $STATE_CRITICAL
+  else
+    echo "ES SYSTEM UNKNOWN - Elasticsearch Cluster returned an unknown health status: ${status:-missing}"
+    exit $STATE_UNKNOWN
   fi
   ;;
 
@@ -679,21 +725,21 @@ master) # Check Cluster Master
   fi
 
   # Sanity checks
-  if [[ $threadpoolrc -eq 7 ]]; then
-    echo "ES SYSTEM CRITICAL - Failed to connect to ${host} port ${port}: Connection refused"
-    exit $STATE_CRITICAL
-  elif [[ $threadpoolrc -eq 28 ]]; then
-    echo "ES SYSTEM CRITICAL - server did not respond within ${max_time} seconds"
-    exit $STATE_CRITICAL
-  elif [[ -n $(echo $esstatus | grep -i "unable to authenticate") ]]; then
+  check_curl_result "$masterrc"
+  if [[ -n $(echo "$master" | grep -i "unable to authenticate") ]]; then
     echo "ES SYSTEM CRITICAL - Unable to authenticate user $user for REST request"
     exit $STATE_CRITICAL
-  elif [[ -n $(echo $esstatus | grep -i "unauthorized") ]]; then
+  elif [[ -n $(echo "$master" | grep -i "unauthorized") ]]; then
     echo "ES SYSTEM CRITICAL - User $user is unauthorized"
     exit $STATE_CRITICAL
   fi
 
   masternode=$(echo "$master" | awk '{print $NF}')
+
+  if [[ -z $masternode || $masternode = "-" ]]; then
+    echo "ES SYSTEM CRITICAL - Elasticsearch cluster has no master node"
+    exit $STATE_CRITICAL
+  fi
 
   if [[ -n ${expect_master} ]]; then
     if [[ "${expect_master}" = "${masternode}" ]]; then
